@@ -310,7 +310,8 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 	pc.unAckChunksTracker = newUnAckChunksTracker(pc)
 	pc.ackGroupingTracker = newAckGroupingTracker(options.ackGroupingOptions,
 		func(id MessageID) { pc.sendIndividualAck(id) },
-		func(id MessageID) { pc.sendCumulativeAck(id) })
+		func(id MessageID) { pc.sendCumulativeAck(id) },
+		func(ids []MessageID) { pc.sendIndividualAcks(ids) })
 	pc.setConsumerState(consumerInit)
 	pc.log = client.log.SubLogger(log.Fields{
 		"name":         pc.name,
@@ -469,10 +470,13 @@ func (pc *partitionConsumer) ackID(msgID MessageID, withResponse bool) error {
 		return errors.New("failed to convert trackingMessageID")
 	}
 
+	batchAck := false
 	if trackingID != nil && trackingID.ack() {
 		pc.metrics.AcksCounter.Inc()
 		pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-trackingID.receivedTime.UnixNano()) / 1.0e9)
-	} else if !pc.options.enableBatchIndexAck {
+	} else if pc.options.enableBatchIndexAck {
+		batchAck = true
+	} else {
 		return nil
 	}
 
@@ -481,7 +485,15 @@ func (pc *partitionConsumer) ackID(msgID MessageID, withResponse bool) error {
 		ackReq := pc.sendIndividualAck(trackingID)
 		<-ackReq.doneCh
 	} else {
-		pc.ackGroupingTracker.add(trackingID)
+		if batchAck {
+			pc.ackGroupingTracker.add(trackingID)
+		} else {
+			pc.ackGroupingTracker.add(&messageID{
+				ledgerID: trackingID.ledgerID,
+				entryID:  trackingID.entryID,
+				batchIdx: -1,
+			})
+		}
 	}
 	pc.options.interceptors.OnAcknowledge(pc.parentConsumer, msgID)
 	if ackReq == nil {
@@ -498,6 +510,10 @@ func (pc *partitionConsumer) sendIndividualAck(msgID MessageID) *ackRequest {
 	}
 	pc.eventsCh <- ackReq
 	return ackReq
+}
+
+func (pc *partitionConsumer) sendIndividualAcks(msgIDs []MessageID) {
+	pc.eventsCh <- msgIDs
 }
 
 func (pc *partitionConsumer) AckIDWithResponse(msgID MessageID) error {
@@ -769,11 +785,13 @@ func (pc *partitionConsumer) internalSeekByTime(seek *seekByTimeRequest) {
 }
 
 func (pc *partitionConsumer) internalAck(req *ackRequest) {
-	defer close(req.doneCh)
 	if state := pc.getConsumerState(); state == consumerClosed || state == consumerClosing {
 		pc.log.WithField("state", state).Error("Failed to ack by closing or closed consumer")
+		close(req.doneCh)
 		return
 	}
+
+	defer close(req.doneCh)
 	msgID := req.msgID
 
 	messageIDs := make([]*pb.MessageIdData, 1)
@@ -816,6 +834,41 @@ func (pc *partitionConsumer) internalAck(req *ackRequest) {
 		pc.log.Error("Connection was closed when request ack cmd")
 		req.err = err
 	}
+}
+
+func (pc *partitionConsumer) internalAckList(msgIDs []MessageID) error {
+	n := len(msgIDs)
+	messageIDs := make([]*pb.MessageIdData, n)
+	for i := 0; i < n; i++ {
+		ledgerID := uint64(msgIDs[i].LedgerID())
+		entryID := uint64(msgIDs[i].EntryID())
+		messageIDs[i] = &pb.MessageIdData{
+			LedgerId: proto.Uint64(ledgerID),
+			EntryId:  proto.Uint64(entryID),
+		}
+		if pc.options.enableBatchIndexAck {
+			trackingID, ok := msgIDs[i].(*trackingMessageID)
+			if ok && trackingID.tracker != nil {
+				ackSet := trackingID.tracker.toAckSet()
+				if ackSet != nil {
+					messageIDs[i].AckSet = ackSet
+				}
+			}
+		}
+	}
+
+	// This method can only be called by pc.ackGroupingTracker, which conflicts with ackWithResponse,
+	// so we don't need to handle the case when ackWithResponse is true.
+	cmdAck := &pb.CommandAck{
+		AckType:    pb.CommandAck_Individual.Enum(),
+		ConsumerId: proto.Uint64(pc.consumerID),
+		MessageId:  messageIDs,
+	}
+	err := pc.client.rpcClient.RequestOnCnxNoWait(pc._getConn(), pb.BaseCommand_ACK, cmdAck)
+	if err != nil {
+		pc.log.Error("Connection was closed when request ack cmd")
+	}
+	return err
 }
 
 func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, headersAndPayload internal.Buffer) error {
@@ -1286,6 +1339,7 @@ const (
 type ackRequest struct {
 	doneCh  chan struct{}
 	msgID   trackingMessageID
+	msgIDs  []MessageID
 	ackType int
 	err     error
 }
@@ -1345,6 +1399,8 @@ func (pc *partitionConsumer) runEventsLoop() {
 			switch v := i.(type) {
 			case *ackRequest:
 				pc.internalAck(v)
+			case []MessageID:
+				pc.internalAckList(v)
 			case *redeliveryRequest:
 				pc.internalRedeliver(v)
 			case *unsubscribeRequest:

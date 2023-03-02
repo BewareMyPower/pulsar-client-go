@@ -19,8 +19,6 @@ package pulsar
 
 import (
 	"time"
-
-	"github.com/bits-and-blooms/bitset"
 )
 
 type ackGroupingTracker interface {
@@ -43,11 +41,13 @@ const (
 	flushOnly ackFlushType = iota
 	flushAndClean
 	flushAndClose
+	flushToCache
 )
 
 func newAckGroupingTracker(options *AckGroupingOptions,
 	ackIndividual func(id MessageID),
-	ackCumulative func(id MessageID)) ackGroupingTracker {
+	ackCumulative func(id MessageID),
+	ackList func(ids []MessageID)) ackGroupingTracker {
 	if options == nil {
 		options = &AckGroupingOptions{
 			MaxSize: 1000,
@@ -63,17 +63,12 @@ func newAckGroupingTracker(options *AckGroupingOptions,
 	}
 
 	c := &cachedAcks{
-		singleAcks:        make([]MessageID, options.MaxSize),
-		pendingAcks:       make(map[int64]*bitset.BitSet),
-		lastCumulativeAck: EarliestMessageID(),
-		ackIndividual:     ackIndividual,
-		ackCumulative:     ackCumulative,
-		ackList: func(ids []MessageID) {
-			// TODO: support ack a list of MessageIDs
-			for _, id := range ids {
-				ackIndividual(id)
-			}
-		},
+		maxNumAcks:                      int(options.MaxSize),
+		pendingIndividualAcks:           make(map[int64]MessageID),
+		pendingIndividualBatchIndexAcks: make(map[int64][]*trackingMessageID),
+		lastCumulativeAck:               EarliestMessageID(),
+		ackCumulative:                   ackCumulative,
+		ackList:                         ackList,
 	}
 
 	timeout := time.NewTicker(time.Hour)
@@ -89,6 +84,7 @@ func newAckGroupingTracker(options *AckGroupingOptions,
 		duplicateResultCh: make(chan bool),
 		flushCh:           make(chan ackFlushType),
 		waitFlushCh:       make(chan bool),
+		cachedAcksCh:      make(chan cachedAcks),
 	}
 	go func() {
 		for {
@@ -110,6 +106,10 @@ func newAckGroupingTracker(options *AckGroupingOptions,
 			case <-timeout.C:
 				c.flush()
 			case ackFlushType := <-t.flushCh:
+				if ackFlushType == flushToCache {
+					t.cachedAcksCh <- *c
+					break
+				}
 				timeout.Stop()
 				c.flush()
 				if ackFlushType == flushAndClean {
@@ -152,45 +152,51 @@ func (i *immediateAckGroupingTracker) close() {
 }
 
 type cachedAcks struct {
-	singleAcks []MessageID
-	index      int
+	maxNumAcks int
+	numAcks    int
 
-	// Key is the hash code of the ledger id and the netry id,
-	// Value is the bit set that represents which messages are acknowledged if the entry stores a batch.
-	// The bit 1 represents the message has been acknowledged, i.e. the bits "111" represents all messages
-	// in the batch whose batch size is 3 are not acknowledged.
-	// After the 1st message (i.e. batch index is 0) is acknowledged, the bits will become "011".
-	// Value is nil if the entry represents a single message.
-	pendingAcks map[int64]*bitset.BitSet
+	pendingIndividualAcks           map[int64]MessageID
+	pendingIndividualBatchIndexAcks map[int64][]*trackingMessageID
 
 	lastCumulativeAck     MessageID
 	cumulativeAckRequired bool
 
-	ackIndividual func(id MessageID)
 	ackCumulative func(id MessageID)
 	ackList       func(ids []MessageID)
 }
 
 func (t *cachedAcks) addAndCheckIfFull(id MessageID) bool {
-	t.singleAcks[t.index] = id
-	t.index++
 	key := messageIDHash(id)
-	ackSet, found := t.pendingAcks[key]
-	if !found {
-		if messageIDIsBatch(id) {
-			ackSet = bitset.New(uint(id.BatchSize()))
-			for i := 0; i < int(id.BatchSize()); i++ {
-				ackSet.Set(uint(i))
-			}
-			t.pendingAcks[key] = ackSet
+	if messageIDIsBatch(id) {
+		ids, _ := t.pendingIndividualBatchIndexAcks[key]
+		if trackingID, ok := id.(*trackingMessageID); ok {
+			t.pendingIndividualBatchIndexAcks[key] = append(ids, trackingID)
 		} else {
-			t.pendingAcks[key] = nil
+			var tracker *ackTracker
+			if len(ids) > 0 {
+				tracker = ids[0].tracker
+			} else {
+				tracker = newAckTracker(uint(id.BatchSize()))
+			}
+			tracker.ack(int(id.BatchIdx()))
+			t.pendingIndividualBatchIndexAcks[key] = append(ids, &trackingMessageID{
+				messageID: id.(*messageID),
+				tracker:   tracker,
+			})
+		}
+		t.numAcks++
+	} else {
+		if _, found := t.pendingIndividualAcks[key]; !found {
+			t.pendingIndividualAcks[key] = id
+			t.numAcks++
+		}
+		// There is no need to acknowledge these individual messages in the batch now
+		if ids, found := t.pendingIndividualBatchIndexAcks[key]; found {
+			delete(t.pendingIndividualBatchIndexAcks, key)
+			t.numAcks -= len(ids)
 		}
 	}
-	if ackSet != nil {
-		ackSet.Clear(uint(id.BatchIdx()))
-	}
-	return t.index == len(t.singleAcks)
+	return t.numAcks >= t.maxNumAcks
 }
 
 func (t *cachedAcks) tryUpdateLastCumulativeAck(id MessageID) {
@@ -204,39 +210,45 @@ func (t *cachedAcks) isDuplicate(id MessageID) bool {
 	if messageIDCompare(t.lastCumulativeAck, id) >= 0 {
 		return true
 	}
-	ackSet, found := t.pendingAcks[messageIDHash(id)]
-	if !found {
-		return false
-	}
-	if ackSet == nil || !messageIDIsBatch(id) {
-		// NOTE: should we panic when ackSet != nil and messageIDIsBatch(id) is true?
+	key := messageIDHash(id)
+	if _, found := t.pendingIndividualAcks[key]; found {
 		return true
 	}
-	// 0 represents the message has been acknowledged
-	return !ackSet.Test(uint(id.BatchIdx()))
+	if id.BatchIdx() < 0 {
+		return false
+	}
+	if ids, found := t.pendingIndividualBatchIndexAcks[key]; found {
+		for _, cachedId := range ids {
+			if id.BatchIdx() == cachedId.BatchIdx() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (t *cachedAcks) flushIndividualAcks() {
-	if t.index > 0 {
-		t.ackList(t.singleAcks[0:t.index])
-		for _, id := range t.singleAcks[0:t.index] {
-			key := messageIDHash(id)
-			ackSet, found := t.pendingAcks[key]
-			if !found {
-				continue
-			}
-			if ackSet == nil {
-				delete(t.pendingAcks, key)
-			} else {
-				ackSet.Clear(uint(id.BatchIdx()))
-				if ackSet.None() { // all messages have been acknowledged
-					delete(t.pendingAcks, key)
-				}
-			}
-			delete(t.pendingAcks, messageIDHash(id))
-		}
-		t.index = 0
+	if t.numAcks == 0 {
+		return
 	}
+	msgIDs := make([]MessageID, t.numAcks)
+	i := 0
+	for _, id := range t.pendingIndividualAcks {
+		msgIDs[i] = id
+		i++
+	}
+	t.pendingIndividualAcks = make(map[int64]MessageID)
+
+	for _, ids := range t.pendingIndividualBatchIndexAcks {
+		for _, id := range ids {
+			msgIDs[i] = id
+			i++
+		}
+	}
+	t.pendingIndividualBatchIndexAcks = make(map[int64][]*trackingMessageID)
+
+	t.ackList(msgIDs)
+	t.numAcks = 0
 }
 
 func (t *cachedAcks) flushCumulativeAck() {
@@ -252,10 +264,8 @@ func (t *cachedAcks) flush() {
 }
 
 func (t *cachedAcks) clean() {
-	maxSize := len(t.singleAcks)
-	t.singleAcks = make([]MessageID, maxSize)
-	t.index = 0
-	t.pendingAcks = make(map[int64]*bitset.BitSet)
+	t.pendingIndividualAcks = make(map[int64]MessageID)
+	t.pendingIndividualBatchIndexAcks = make(map[int64][]*trackingMessageID)
 	t.lastCumulativeAck = EarliestMessageID()
 	t.cumulativeAckRequired = false
 }
@@ -267,6 +277,8 @@ type timedAckGroupingTracker struct {
 	duplicateResultCh chan bool
 	flushCh           chan ackFlushType
 	waitFlushCh       chan bool
+	// Only used for test
+	cachedAcksCh chan cachedAcks
 }
 
 func (t *timedAckGroupingTracker) add(id MessageID) {
@@ -295,4 +307,10 @@ func (t *timedAckGroupingTracker) flushAndClean() {
 func (t *timedAckGroupingTracker) close() {
 	t.flushCh <- flushAndClose
 	<-t.waitFlushCh
+}
+
+// Only used for test
+func (t *timedAckGroupingTracker) getCache() cachedAcks {
+	t.flushCh <- flushToCache
+	return <-t.cachedAcksCh
 }

@@ -3988,3 +3988,49 @@ func runBatchIndexAckTest(t *testing.T, ackWithResponse bool, cumulative bool, o
 
 	client.Close()
 }
+
+func TestBatchIndexAckAllMessages(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	c, err := client.Subscribe(ConsumerOptions{
+		Topic:                          topic,
+		SubscriptionName:               "my-sub",
+		EnableBatchIndexAcknowledgment: true,
+		AckGroupingOptions:             &AckGroupingOptions{MaxSize: 7, MaxTime: 0},
+	})
+	assert.Nil(t, err)
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:               topic,
+		BatchingMaxMessages: 5,
+	})
+	assert.Nil(t, err)
+
+	for i := 0; i < 10; i++ {
+		producer.SendAsync(context.Background(), &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("msg-%d", i)),
+		}, nil)
+	}
+
+	consumers := c.(*consumer).consumers
+	assert.Equal(t, 1, len(consumers))
+	for i := 0; i < 10; i++ {
+		msg, err := c.Receive(context.Background())
+		assert.Nil(t, err)
+		c.Ack(msg)
+		if i == 5 {
+			cache := consumers[0].ackGroupingTracker.(*timedAckGroupingTracker).getCache()
+			// The 5 messageIDs in the 1st batch were converted into a non-batched messageID
+			assert.Equal(t, 1, len(cache.pendingIndividualAcks))
+			assert.Equal(t, 1, len(cache.pendingIndividualBatchIndexAcks))
+		}
+	}
+	cache := consumers[0].ackGroupingTracker.(*timedAckGroupingTracker).getCache()
+	// 2 batches were both converted into non-batched messageIDs
+	assert.Equal(t, 2, len(cache.pendingIndividualAcks))
+	assert.Equal(t, 0, len(cache.pendingIndividualBatchIndexAcks))
+}

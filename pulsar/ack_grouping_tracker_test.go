@@ -19,6 +19,7 @@ package pulsar
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 )
+
+func newAckGroupingTrackerForTest(option *AckGroupingOptions,
+	ackIndividual func(id MessageID),
+	ackCumulative func(id MessageID)) ackGroupingTracker {
+	return newAckGroupingTracker(option, ackIndividual, ackCumulative,
+		func(ids []MessageID) {
+			for _, id := range ids {
+				ackIndividual(id)
+			}
+		})
+}
 
 func TestNoCacheTracker(t *testing.T) {
 	tests := []AckGroupingOptions{
@@ -43,7 +55,7 @@ func TestNoCacheTracker(t *testing.T) {
 			func(t *testing.T) {
 				ledgerID0 := int64(-1)
 				ledgerID1 := int64(-1)
-				tracker := newAckGroupingTracker(&option,
+				tracker := newAckGroupingTrackerForTest(&option,
 					func(id MessageID) { ledgerID0 = id.LedgerID() },
 					func(id MessageID) { ledgerID1 = id.LedgerID() })
 
@@ -74,7 +86,9 @@ func (a *mockAcker) ackCumulative(id MessageID) {
 func (a *mockAcker) getLedgerIDs() []int64 {
 	defer a.Unlock()
 	a.Lock()
-	return a.ledgerIDs
+	ids := a.ledgerIDs
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func (a *mockAcker) getCumulativeLedgerID() int64 {
@@ -88,7 +102,7 @@ func (a *mockAcker) reset() {
 
 func TestCachedTracker(t *testing.T) {
 	var acker mockAcker
-	tracker := newAckGroupingTracker(&AckGroupingOptions{MaxSize: 3, MaxTime: 0},
+	tracker := newAckGroupingTrackerForTest(&AckGroupingOptions{MaxSize: 3, MaxTime: 0},
 		func(id MessageID) { acker.ack(id) }, func(id MessageID) { acker.ackCumulative(id) })
 
 	tracker.add(&messageID{ledgerID: 1})
@@ -126,7 +140,7 @@ func TestCachedTracker(t *testing.T) {
 func TestTimedTrackerIndividualAck(t *testing.T) {
 	var acker mockAcker
 	// MaxSize: 1000, MaxTime: 100ms
-	tracker := newAckGroupingTracker(nil, func(id MessageID) { acker.ack(id) }, nil)
+	tracker := newAckGroupingTrackerForTest(nil, func(id MessageID) { acker.ack(id) }, nil)
 
 	expected := make([]int64, 0)
 	for i := 0; i < 999; i++ {
@@ -161,7 +175,7 @@ func TestTimedTrackerIndividualAck(t *testing.T) {
 func TestTimedTrackerCumulativeAck(t *testing.T) {
 	var acker mockAcker
 	// MaxTime is 100ms
-	tracker := newAckGroupingTracker(nil, nil, func(id MessageID) { acker.ackCumulative(id) })
+	tracker := newAckGroupingTrackerForTest(nil, nil, func(id MessageID) { acker.ackCumulative(id) })
 
 	// case 1: flush because of the timeout
 	tracker.addCumulative(&messageID{ledgerID: 1})
@@ -182,7 +196,7 @@ func TestTimedTrackerCumulativeAck(t *testing.T) {
 }
 
 func TestTimedTrackerIsDuplicate(t *testing.T) {
-	tracker := newAckGroupingTracker(nil, func(id MessageID) {}, func(id MessageID) {})
+	tracker := newAckGroupingTrackerForTest(nil, func(id MessageID) {}, func(id MessageID) {})
 
 	tracker.add(&messageID{batchIdx: 0, batchSize: 3})
 	tracker.add(&messageID{batchIdx: 2, batchSize: 3})

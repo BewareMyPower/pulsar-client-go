@@ -35,6 +35,8 @@ type ConsumeArgs struct {
 	SubscriptionName    string
 	ReceiverQueueSize   int
 	EnableBatchIndexAck bool
+	AckGroupMaxSize     uint32
+	AckGroupMaxTimeMs   uint32
 }
 
 func newConsumerCommand() *cobra.Command {
@@ -57,6 +59,8 @@ func newConsumerCommand() *cobra.Command {
 	flags.StringVarP(&consumeArgs.SubscriptionName, "subscription", "s", "sub", "Subscription name")
 	flags.IntVarP(&consumeArgs.ReceiverQueueSize, "receiver-queue-size", "r", 1000, "Receiver queue size")
 	flags.BoolVar(&consumeArgs.EnableBatchIndexAck, "enable-batch-index-ack", false, "Whether to enable batch index ACK")
+	flags.Uint32Var(&consumeArgs.AckGroupMaxSize, "ack-group-max-size", uint32(1000), "Maximum number of ACK requests to cache")
+	flags.Uint32Var(&consumeArgs.AckGroupMaxTimeMs, "ack-group-max-ms", uint32(100), "Maximum number of ACK requests to cache")
 
 	return cmd
 }
@@ -79,6 +83,10 @@ func consume(consumeArgs *ConsumeArgs, stop <-chan struct{}) {
 		Topic:                          consumeArgs.Topic,
 		SubscriptionName:               consumeArgs.SubscriptionName,
 		EnableBatchIndexAcknowledgment: consumeArgs.EnableBatchIndexAck,
+		AckGroupingOptions: &pulsar.AckGroupingOptions{
+			MaxSize: consumeArgs.AckGroupMaxSize,
+			MaxTime: time.Millisecond * time.Duration(consumeArgs.AckGroupMaxTimeMs),
+		},
 	})
 
 	if err != nil {
